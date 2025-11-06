@@ -1,0 +1,24 @@
+#Step 1: Detect + crop faces (2 classes)
+python scripts3/01_detect_and_crop_faces_yolo_2class.py --data_dir Datasets2 --output_dir data3/processed --splits train valid test
+
+#Step 2: Extract landmarks
+python scripts3/02_extract_landmarks_yolo_2class.py --crops_dir data3/processed --output_dir data3/processed/landmarks --splits train valid test
+
+#Step 3: Train landmark modelsS
+#3.1 Random Forest
+python scripts3/03_train_landmark_ml_yolo_2class.py --features_dir data3/processed/landmarks --output_dir models3/landmark_ml --classifier rf --use_smote --tune_hyperparams
+
+#3.2 XGBoost
+python scripts3/03_train_landmark_ml_yolo_2class.py --features_dir data3/processed/landmarks --output_dir models3/landmark_ml --classifier xgb --use_smote --tune_hyperparams
+
+#Step 4: Train MobileNetV2
+python scripts3/04_train_mobilenetv2_yolo_2class.py --data_dir data3/processed/crops --output_dir models3/image_baseline --results_dir Results3/training --epochs 50
+
+#Step 5: Test MobileNetV2
+python scripts3/05_test_mobilenetv2_yolo_2class.py --data_dir data3/processed/crops --model_path models3/image_baseline/mobilenetv2_best_2class.pt --results_dir Results3/testing
+
+#Step 6: Video inference
+python scripts3/06_infer_video_mobilenetv2_2class.py --video_path path/to/your/video.mp4 --model_path models3/image_baseline/mobilenetv2_best_2class.pt --output_path Results3/video_output_2class.mp4 --show_video
+
+#Step 7: Ensemble inference
+python scripts3/07_infer_video_ensemble_2class.py --video_path 3.mp4 --output_path Results3/video_output_ensemble_2class.mp4 --image_model_path models3/image_baseline/mobilenetv2_best_2class.pt --landmark_model_path models3/landmark_ml/best_landmark_rf_2class.pkl --landmark_scaler_path models3/landmark_ml/scaler_rf_2class.pkl --landmark_metadata_path models3/landmark_ml/metadata_rf_2class.pkl --face_weights weights/yolov8n-face.pt --alpha 0.7 --show_video --device cpu

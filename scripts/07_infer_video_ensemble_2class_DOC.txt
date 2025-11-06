@@ -1,0 +1,130 @@
+ชื่อไฟล์: scripts3/07_infer_video_ensemble_2class.py
+หัวข้อ: ระบบอนุมานแบบวิดีโอ (Video Inference) ด้วยวิธี Ensemble (2 คลาส: no_mask, mask) พร้อมการติดตามบุคคล (Tracking) แบบ ByteTrack-Style และการทำ smoothing เชิงเวลา
+
+1) วัตถุประสงค์
+- สร้างระบบตรวจจับและจำแนกการสวมหน้ากากในวิดีโอแบบเรียลไทม์ โดยใช้การผสมผล (ensemble) จาก 2 โมเดล ได้แก่
+  (ก) โมเดลภาพ (Image Model): MobileNetV2 สำหรับจำแนกคลาสจากภาพใบหน้าที่ถูกครอป
+  (ข) โมเดลแลนด์มาร์ก (Landmark Model): RandomForest (RF) ที่รับฟีเจอร์จาก MediaPipe FaceMesh เพื่อช่วยยืนยันผลการจำแนก
+- ใช้ตัวตรวจจับใบหน้า YOLOv8-face เพื่อหา bounding box ของใบหน้าในแต่ละเฟรม
+- ใช้แนวคิดติดตามวัตถุ (tracking) แบบ ByteTrack-Style (ปรับให้เบาและเรียบง่าย) เพื่อให้บุคคลเดียวกันมี track ID ต่อเนื่องข้ามเฟรม
+- ลดอาการ “สลับคลาสข้ามเฟรม” (label switch) ด้วยการทำ smoothing เชิงเวลา ได้แก่ EMA, hysteresis, debounce และ majority window
+
+2) ภาพรวมสถาปัตยกรรมและท่อการประมวลผล (Pipeline)
+เฟรมหลักของระบบในแต่ละเวลา t ประกอบด้วย:
+2.1 การตรวจจับใบหน้า (Face Detection)
+- ใช้ YOLOv8-face โหลดจากไฟล์น้ำหนัก เช่น weights/yolov8n-face.pt
+- อินพุต: เฟรมภาพจากวิดีโอ
+- เอาต์พุต: รายการ bounding boxes ของใบหน้าในรูปแบบ (x1, y1, x2, y2) และความเชื่อมั่น (confidence)
+
+2.2 การครอปและการเตรียมภาพ (Crop & Preprocess)
+- ครอปภาพใบหน้าโดยเพิ่มขอบ padding เล็กน้อย (เช่น 10%) เพื่อเผื่อพื้นที่รอบใบหน้า
+- ปรับขนาดครอปเป็น 500x500 พิกเซล (ให้สอดคล้องกับการเทรน MobileNetV2)
+- ทำ normalization (mean/std ของ ImageNet) ก่อนป้อนเข้าโมเดล MobileNetV2
+
+2.3 การจำแนกผลแบบภาพ (Image Classification: MobileNetV2)
+- สร้าง/โหลดสถาปัตยกรรม MobileNetV2 (ปรับชั้นสุดท้ายให้เป็น 2 คลาส)
+- โหลดน้ำหนักจากไฟล์ เช่น models3/image_baseline/mobilenetv2_best_2class.pt
+- ได้ความน่าจะเป็น 2 คลาส p_img = softmax(logits_img)
+
+2.4 การสกัดฟีเจอร์แลนด์มาร์กจากใบหน้า (Landmark Feature Extraction)
+- ใช้ MediaPipe FaceMesh (max_num_faces=1, refine_landmarks=True) กับครอปใบหน้า
+- สกัดฟีเจอร์เชิงเรขาคณิตและเชิงมิติ เช่น ความกว้าง/ความสูงของตา ปาก จมูก อัตราส่วนต่างๆ ระยะระหว่างจุดสำคัญ และค่าความมองเห็น (visibility) บางจุด
+- นำฟีเจอร์ไป scale ด้วย StandardScaler เดิมที่ใช้ตอนเทรน RF (โหลดจากไฟล์ scaler_rf_2class.pkl)
+
+2.5 การจำแนกผลด้วย RandomForest (Landmark Classification)
+- โหลดโมเดล RF จากไฟล์ เช่น models3/landmark_ml/best_landmark_rf_2class.pkl
+- คำนวณความน่าจะเป็น 2 คลาส p_land = RF.predict_proba(features)
+- หมายเหตุ: หาก MediaPipe ล้มเหลวหรือโมเดล RF/Scaler ไม่พร้อมใช้งาน จะ fallback ใช้เฉพาะ p_img
+
+2.6 การผสมผลแบบ Ensemble (Late Fusion)
+- รวม p_img และ p_land ด้วยการถ่วงน้ำหนัก:
+  p_final = α · p_img + (1 - α) · p_land,  โดย α ∈ [0,1]
+- ค่าปริยาย: α = 0.7 (ให้น้ำหนักกับ MobileNetV2 มากกว่า เนื่องจาก accuracy สูงกว่า)
+- Normalize p_final ให้เป็นสัดส่วนความน่าจะเป็น (ผลรวม = 1)
+
+2.7 การติดตามวัตถุ (Tracking) แบบ ByteTrack-Style (ฉบับย่อ)
+- ใช้กลยุทธ์จับคู่กล่องข้ามเฟรมด้วย IoU + greedy matching (เลือกคู่ที่ IoU สูงสุดก่อน ภายใต้ threshold)
+- โครงสร้าง Track จะเก็บข้อมูล: track_id, bbox, อายุ (age), hits, ค่า EMA ความน่าจะเป็น, ประวัติการคาดเดาแบบฮาร์ด (window_preds)
+- พารามิเตอร์หลัก:
+  - iou_threshold: เกณฑ์จับคู่กล่อง (เช่น 0.3)
+  - max_age: อายุสูงสุดของ track ที่ยังคงเก็บไว้แม้ไม่มีการจับคู่นานชั่วคราว (เช่น 30 เฟรม)
+  - min_hits: จำนวนเฟรมขั้นต่ำก่อนยอมรับ track ใหม่ (สามารถขยายในงานจริง)
+- ข้อดี: เบา ไม่พึ่งพา embedding และใช้งานง่ายพอสำหรับ scenario ใบหน้าทั่วไป
+
+2.8 การทำ smoothing เชิงเวลา (Temporal Smoothing) ต่อ track
+- Exponential Moving Average (EMA): อัปเดต p_ema = β · p_ema + (1 - β) · p_final
+  - กรองเฟรมที่ความมั่นใจต่ำ (max(p_final) < 0.55) ออกจาก EMA เพื่อกัน noise
+  - ค่าปริยาย: β = 0.85 (สร้างความนิ่งแต่ยังตอบสนองเร็ว)
+- Hysteresis & Debounce:
+  - ใช้เกณฑ์สองระดับ t_on > t_off (เช่น t_on=0.7, t_off=0.6)
+  - อนุญาตให้ “สลับคลาส” ต่อเมื่อ prob_ema ของคลาสใหม่สูงกว่า t_on และมากกว่าอีกคลาสด้วย margin (เช่น 0.1) ต่อเนื่อง K เฟรม (เช่น K=3)
+  - ถ้า prob_ema ต่ำกว่า t_off ให้คงคลาสเดิมไว้ หรือใช้ majority window เป็นตัวช่วย
+- Majority Window (ทางสำรอง):
+  - เก็บ pred ล่าสุด N เฟรม (เช่น N=9) แล้วใช้คะแนนเสียงข้างมากในกรณี EMA ยังไม่มั่นใจ
+- ผลลัพธ์สุดท้ายของแต่ละ track จะมาจากกลไกเหนือ (label สุดท้ายและความมั่นใจจาก prob_ema)
+
+2.9 การเรนเดอร์ผลลัพธ์ (Rendering)
+- วาดกรอบสี่เหลี่ยม (bbox) รอบใบหน้า และใส่ป้ายข้อความ “ID <track_id> | <label> <confidence>”
+- สีป้าย: no_mask = เขียว, mask = แดง (เพื่อความคงเส้นคงวากับสคริปต์ก่อนหน้า)
+- เขียนเฟรมลงไฟล์วิดีโอเอาต์พุต (เช่น Results3/video_output_ensemble_2class.mp4) และแสดงหน้าจอแบบเรียลไทม์ตามออปชัน --show_video
+
+3) อินพุต/เอาต์พุต และอาร์กิวเมนต์ (CLI)
+อินพุตหลัก:
+- --video_path: พาธไฟล์วิดีโอเข้า
+- --image_model_path: น้ำหนัก MobileNetV2 (เช่น models3/image_baseline/mobilenetv2_best_2class.pt)
+- --landmark_model_path: โมเดล RF (เช่น models3/landmark_ml/best_landmark_rf_2class.pkl)
+- --landmark_scaler_path: Scaler ที่ใช้คู่กับ RF (เช่น models3/landmark_ml/scaler_rf_2class.pkl)
+- --face_weights: น้ำหนัก YOLOv8-face (เช่น weights/yolov8n-face.pt)
+
+เอาต์พุตหลัก:
+- --output_path: ไฟล์วิดีโอผลลัพธ์ (MP4)
+- (ออปชัน) --save_csv: บันทึกผลต่อเฟรม/ต่อ track ลง CSV (สามารถขยายในเวอร์ชันถัดไป)
+
+พารามิเตอร์สำคัญอื่น ๆ:
+- --alpha: น้ำหนักของ MobileNetV2 ในการผสมผล (ดีฟอลต์ 0.7)
+- --conf_threshold: เกณฑ์ความเชื่อมั่นของ YOLO สำหรับตรวจจับใบหน้า (ดีฟอลต์ 0.5)
+- --device: cpu หรือ cuda
+- --iou_threshold: เกณฑ์ IoU สำหรับ matching (ดีฟอลต์ 0.3)
+- --max_age: อายุสูงสุดของ track ที่ยังเก็บไว้ (ดีฟอลต์ 30)
+- --ema_beta: พารามิเตอร์ EMA (ดีฟอลต์ 0.85)
+- --t_on, --t_off: เกณฑ์ hysteresis (ดีฟอลต์ 0.7/0.6)
+- --margin: ส่วนต่างขั้นต่ำของคลาสชนะเหนืออีกคลาสสำหรับการสลับ (ดีฟอลต์ 0.1)
+- --K: จำนวนเฟรมติดต่อกันที่ต้องการสำหรับยืนยันการสลับคลาส (ดีฟอลต์ 3)
+- --window_N: ขนาดหน้าต่าง majority vote (ดีฟอลต์ 9)
+
+ตัวอย่างคำสั่งรัน:
+python scripts3/07_infer_video_ensemble_2class.py \
+  --video_path path/to/video.mp4 \
+  --output_path Results3/video_output_ensemble_2class.mp4 \
+  --image_model_path models3/image_baseline/mobilenetv2_best_2class.pt \
+  --landmark_model_path models3/landmark_ml/best_landmark_rf_2class.pkl \
+  --landmark_scaler_path models3/landmark_ml/scaler_rf_2class.pkl \
+  --face_weights weights/yolov8n-face.pt \
+  --alpha 0.7 --show_video --device cpu
+
+4) การออกแบบเพื่อความทนทาน (Robustness)
+- Fallback อัตโนมัติ: หากไม่สามารถดึงฟีเจอร์แลนด์มาร์กได้ (MediaPipe ล้มเหลว/ไม่ติดตั้ง) หรือไม่พบโมเดล RF/Scaler ระบบจะใช้เฉพาะ MobileNetV2 ในการอนุมาน
+- กรองใบหน้าที่เล็ก/เบลอ: ข้ามใบหน้าที่มีขนาดเล็กมาก (เช่น น้อยกว่า 20 พิกเซลด้านใดด้านหนึ่ง) เพื่อหลีกเลี่ยงการอนุมานผิดพลาดจากข้อมูลคุณภาพต่ำ
+- Normalization ของความน่าจะเป็น: หลังการผสมผลจะ normalize p_final ให้ผลรวมเป็น 1 เพื่อความถูกต้องในการตีความความเชื่อมั่น
+- ความสอดคล้องกับ pipeline ก่อนหน้า: การครอปและปรับขนาด (500x500) และ normalization ใช้ค่ามาตรฐานเดียวกับตอนเทรน MobileNetV2 เพื่อหลีกเลี่ยง domain shift
+
+5) เหตุผลเชิงวิศวกรรมสำหรับการเลือกเทคนิค
+- YOLOv8-face: แม่นยำและเบาสำหรับตรวจจับใบหน้าในเฟรมวิดีโอทั่วไป
+- MobileNetV2: โมเดลเบา infer เร็ว เหมาะสำหรับงาน 2 คลาส และให้ผลดีบนชุดข้อมูลนี้
+- RandomForest + MediaPipe FaceMesh: ให้สัญญาณยืนยันด้วยฟีเจอร์เชิงโครงสร้างใบหน้า โดยเฉพาะบริเวณจมูก/ปาก/คาง ซึ่งสัมพันธ์กับการสวมหน้ากาก
+- Ensemble (weighted average): ลดความเสี่ยงจากจุดอ่อนของโมเดลใดโมเดลหนึ่ง เพิ่มความเสถียรของผลลัพธ์
+- Tracking แบบ ByteTrack-Style: เรียบง่าย ไม่ต้องใช้ embedding ทำงานได้ดีพอในโจทย์ติดตามใบหน้าในวิดีโอทั่วไป และทำให้ระบุ ID ต่อเนื่องได้
+- Temporal smoothing (EMA + hysteresis + debounce + majority): ลดอาการสลับคลาสจาก noise รายเฟรม ทำให้ฉลากสุดท้ายมีเสถียรภาพมากขึ้น
+
+6) ข้อจำกัดและแนวทางปรับปรุงในอนาคต
+- ในกรณีที่มีการบังกันนาน ๆ หรือบุคคลหายไปแล้วกลับเข้ามาใหม่ อาจทำให้ ID เปลี่ยนได้ การใช้ DeepSORT (มี Re-ID) อาจช่วยรักษา ID เดิมได้ดีขึ้น
+- สามารถเพิ่มการทำ calibration ของความน่าจะเป็น (เช่น temperature scaling) เพื่อปรับปรุงความน่าเชื่อถือของค่าความเชื่อมั่น
+- เพิ่มการกรองคุณภาพครอป (เช่น blur detection ด้วย variance of Laplacian) เพื่อคัดทิ้งครอปที่ไม่เหมาะสมต่อการอนุมาน
+- เพิ่มการบันทึก CSV per-frame/per-track ที่ละเอียดขึ้น (time stamp, bbox, probs ทั้งสองโมเดลและหลังผสม, สถานะ EMA) เพื่อใช้ในงานวิเคราะห์/Thesis
+
+7) สรุปผลกระทบและประโยชน์
+- ระบบ ensemble นี้รวมข้อดีของทั้งภาพและแลนด์มาร์ก ช่วยเพิ่มความเสถียรและความแม่นยำในการตัดสินผลสวม/ไม่สวมหน้ากาก
+- การใช้การติดตามร่วมกับ smoothing เชิงเวลา ช่วยให้ฉลากต่อเนื่องของบุคคลเดียวกันนิ่งขึ้น ลดการสลับคลาสข้ามเฟรม
+- ออกแบบให้ใช้งานจริงได้ง่าย ปรับพารามิเตอร์ผ่าน CLI ได้ และรองรับ fallback เมื่อตัวประกอบบางส่วนไม่พร้อมใช้งาน
+
+เวอร์ชันเอกสาร: 1.0 (ภาษาไทย)
