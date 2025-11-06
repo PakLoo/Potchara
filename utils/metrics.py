@@ -8,17 +8,33 @@ from sklearn.metrics import confusion_matrix, classification_report, roc_auc_sco
 from .paths import ensure_dir, ID_TO_PRETTY
 
 
-def save_confusion_matrix(y_true: List[int], y_pred: List[int], save_path: str) -> None:
+def save_confusion_matrix(y_true, y_pred, save_path: str,
+                          class_names=None, order=None) -> None:
     ensure_dir(os.path.dirname(save_path))
-    cm = confusion_matrix(y_true, y_pred)
-    labels = [ID_TO_PRETTY[i] for i in range(len(ID_TO_PRETTY))]
+
+    # บังคับลำดับคลาสตาม order ถ้ามี (order คือ index ของคลาสใน y_true/y_pred)
+    if order is not None:
+        cm = confusion_matrix(y_true, y_pred, labels=order)
+    else:
+        cm = confusion_matrix(y_true, y_pred)
+
+    if class_names is None:
+        labels = [ID_TO_PRETTY[i] for i in range(len(ID_TO_PRETTY))]
+    else:
+        labels = class_names
+
     plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=labels, yticklabels=labels)
+    ax = sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                     xticklabels=labels, yticklabels=labels)
     plt.ylabel("Actual")
     plt.xlabel("Predicted")
+    plt.title("Confusion Matrix")
+    ax.xaxis.set_label_position('top')
+    ax.xaxis.tick_top()
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
+
 
 
 def save_classification_report(y_true: List[int], y_pred: List[int], save_txt: str, save_csv: str) -> None:
