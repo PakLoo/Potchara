@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 3
+names: ['a_without_mask', 'b_mask_weared_incorrect', 'c_with_mask']
+
+roboflow:
+  workspace: ignacio-viuales
+  project: face-mask-detection-gttfv
+  version: 4
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/ignacio-viuales/face-mask-detection-gttfv/dataset/4
